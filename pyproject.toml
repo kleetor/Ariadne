@@ -1,0 +1,48 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ariadne"
+version = "0.1.0"
+description = "Ariadne: LLM DBA管理与目的驱动的联想记忆检索系统 — A thread through the labyrinth of memory"
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.10"
+authors = [
+    {name = "Ariadne Contributors"},
+]
+
+dependencies = [
+    "networkx>=3.0",
+    "numpy>=1.24",
+    "pyyaml>=6.0",
+    "langchain>=0.2",
+    "langchain-openai>=0.1",
+    "langchain-community>=0.2",
+    "faiss-cpu>=1.7",
+    "mcp>=2.0",
+    "uvicorn>=0.30",
+    "starlette>=0.37",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+]
+local = [
+    "sentence-transformers>=2.2",
+    "torch>=2.0",
+]
+
+[project.scripts]
+ariadne-api = "dba_pipeline.viz.api_server:main"
+ariadne-mcp = "dba_pipeline.mcp_server:main"
+ariadne-render = "dba_pipeline.viz.renderer:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["dba_pipeline*"]
+
+[tool.setuptools.package-data]
+dba_pipeline = ["viz/templates/*.html"]

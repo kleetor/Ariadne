@@ -1,0 +1,230 @@
+Metadata-Version: 2.4
+Name: ariadne
+Version: 0.1.0
+Summary: Ariadne: LLM DBA管理与目的驱动的联想记忆检索系统 — A thread through the labyrinth of memory
+Author: Ariadne Contributors
+License: MIT
+Requires-Python: >=3.10
+Description-Content-Type: text/markdown
+Requires-Dist: networkx>=3.0
+Requires-Dist: numpy>=1.24
+Requires-Dist: pyyaml>=6.0
+Requires-Dist: langchain>=0.2
+Requires-Dist: langchain-openai>=0.1
+Requires-Dist: langchain-community>=0.2
+Requires-Dist: faiss-cpu>=1.7
+Requires-Dist: mcp>=2.0
+Requires-Dist: uvicorn>=0.30
+Requires-Dist: starlette>=0.37
+Provides-Extra: dev
+Requires-Dist: pytest>=8.0; extra == "dev"
+Provides-Extra: local
+Requires-Dist: sentence-transformers>=2.2; extra == "local"
+Requires-Dist: torch>=2.0; extra == "local"
+
+# Ariadne — LLM DBA管理与目的驱动的联想记忆检索系统
+
+LLM 驱动的记忆图谱构建、检索、可视化全链路管线。
+
+> *"A thread through the labyrinth of memory."*  
+> 记忆迷宫中的阿里阿德涅之线。
+
+## 架构
+
+```
+对话日志 ──→ DBA维护 ──→ MemoryGraph + VectorStore ──→ P检索 ──→ Rerank ──→ 回复
+   │            │                    │
+   │     MaintenanceScheduler       ├──→ API Server (HTTP REST)
+   │     (批量异步调度)              ├──→ MCP Server (6 tools, stdio/SSE)
+   │                                └──→ 3D 可视化面板 (3d-force-graph)
+   │
+   └──→ 人工干预 (CRUD面板 + MCP dba_intervene)
+```
+
+## 安装
+
+```bash
+pip install -e .
+# 本地 embedding 模型（可选，不使用 API 时需要）
+pip install -e ".[local]"
+```
+
+## Embedding 配置
+
+支持三种模式：
+
+| 模式 | 说明 | 示例 |
+|------|------|------|
+| **API（默认）** | 调用任意 OpenAI 兼容 API | OpenAI / SiliconFlow / DeepSeek / 本地 vLLM |
+| **本地模型** | 使用 sentence-transformers，无需网络 | `BAAI/bge-large-zh-v1.5` |
+| **不使用** | 仅图谱操作，不启用向量检索 | 存根模式无需 embedding |
+
+### API 模式（OpenAI / SiliconFlow / DeepSeek / 自定义）
+
+```bash
+# OpenAI
+ariadne-mcp --yaml data.yaml \
+    --llm-model gpt-4o-mini --llm-api-key sk-xxx --llm-base-url https://api.openai.com/v1 \
+    --embedding-model text-embedding-3-small
+
+# SiliconFlow
+ariadne-mcp --yaml data.yaml \
+    --llm-model deepseek-ai/DeepSeek-V3 --llm-api-key sf-xxx --llm-base-url https://api.siliconflow.cn/v1 \
+    --embedding-model BAAI/bge-m3
+
+# 自定义兼容 API（如本地 vLLM）
+ariadne-mcp --yaml data.yaml \
+    --llm-model qwen2.5 --llm-base-url http://localhost:8000/v1 \
+    --embedding-model bge-m3 --embedding-base-url http://localhost:8000/v1
+```
+
+`--embedding-base-url` 和 `--embedding-api-key` 未指定时自动复用 `--llm-base-url` 和 `--llm-api-key`。
+
+### 本地模式
+
+```bash
+ariadne-mcp --yaml data.yaml --llm-model gpt-4o-mini --llm-api-key sk-xxx \
+    --embedding-model BAAI/bge-large-zh-v1.5 --embedding-local
+```
+
+首次运行会自动下载模型到本地缓存。
+
+## 快速开始
+
+### 1. 启动 API 服务器（3D 可视化面板 + CRUD）
+
+```bash
+ariadne-api --yaml your_memory_graph.yaml --port 8765
+# 浏览器打开 http://127.0.0.1:8765 查看 3D 图谱
+```
+
+### 2. 启动 MCP Server（供 LLM Agent 调用）
+
+```bash
+# stdio 模式
+ariadne-mcp --yaml your_memory_graph.yaml
+
+# SSE 模式
+ariadne-mcp --yaml your_memory_graph.yaml --sse --port 8765
+```
+
+### 3. 生成离线 HTML
+
+```bash
+ariadne-render --yaml your_memory_graph.yaml -o output.html
+```
+
+## 6 个 MCP Tool
+
+| Tool | 说明 |
+|------|------|
+| `dba_add_conversation` | 追加对话，触发图谱维护 |
+| `dba_query_memory` | 搜索记忆节点 |
+| `dba_inspect_graph` | 查看图谱（节点展开 / 话题搜索） |
+| `dba_intervene` | 人工 CRUD（create/update/delete 节点和边） |
+| `dba_checkpoint` | 保存完整检查点 |
+| `dba_get_stats` | 图谱统计信息 |
+
+## Agent 接入配置（MCP Client JSON）
+
+### Claude Desktop (`claude_desktop_config.json`)
+
+**存根模式**（仅图谱操作）:
+```json
+{
+  "mcpServers": {
+    "ariadne": {
+      "command": "python",
+      "args": ["-m", "dba_pipeline.mcp_server", "--yaml", "/path/to/memory_graph.yaml"],
+      "cwd": "/path/to/dba_pipeline"
+    }
+  }
+}
+```
+
+**API Embedding**（OpenAI 为例，自动复用 `--llm-base-url`）:
+```json
+{
+  "mcpServers": {
+    "ariadne": {
+      "command": "python",
+      "args": [
+        "-m", "dba_pipeline.mcp_server",
+        "--yaml", "/path/to/memory_graph.yaml",
+        "--llm-model", "gpt-4o-mini",
+        "--llm-api-key", "sk-xxx",
+        "--llm-base-url", "https://api.openai.com/v1",
+        "--embedding-model", "text-embedding-3-small"
+      ],
+      "cwd": "/path/to/dba_pipeline"
+    }
+  }
+}
+```
+
+**本地 Embedding**（无需 embedding API key）:
+```json
+{
+  "mcpServers": {
+    "ariadne": {
+      "command": "python",
+      "args": [
+        "-m", "dba_pipeline.mcp_server",
+        "--yaml", "/path/to/memory_graph.yaml",
+        "--llm-model", "gpt-4o-mini",
+        "--llm-api-key", "sk-xxx",
+        "--embedding-model", "BAAI/bge-large-zh-v1.5",
+        "--embedding-local"
+      ],
+      "cwd": "/path/to/dba_pipeline"
+    }
+  }
+}
+```
+
+### Cursor / SSE 客户端
+```json
+{
+  "mcpServers": {
+    "ariadne": {
+      "url": "http://127.0.0.1:8765/sse"
+    }
+  }
+}
+```
+
+## YAML 数据格式
+
+节点：
+```yaml
+nodes:
+  - id: n1
+    content: "用户在一家互联网公司做后端开发"
+    type: status
+```
+
+边：
+```yaml
+edges:
+  - from: n1
+    to: n2
+    type: causal
+    bidirectional: false
+```
+
+## 节点类型（6 种）
+
+STATUS | REASON | ACTION | THING | PERSON | EMOTION
+
+## 边类型（8 种）
+
+CAUSAL | SCENARIO | SEQUENCE | PREFERENCE | SOCIAL | ATTRIBUTE | TEMPORAL | TAXONOMIC
+
+## 论文
+
+- [LLM DBA 自动化记忆图谱构建](../docs/LLM%20DBA自动化图谱构建.md)
+- [目的驱动的联想记忆检索模型](../docs/目的驱动的联想记忆检索模型.md)
+
+## 许可证
+
+MIT
