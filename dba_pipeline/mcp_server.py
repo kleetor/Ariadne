@@ -91,11 +91,12 @@ class DBAServer:
     """DBA 核心逻辑，与 MCP 协议层解耦"""
 
     def __init__(self, graph: MemoryGraph, yaml_path: str = None,
-                 dba=None, scheduler=None):
+                 dba=None, scheduler=None, retriever=None):
         self.graph = graph
         self.yaml_path = yaml_path
         self.dba = dba          # 可选: MemoryDBA 实例
         self.scheduler = scheduler  # 可选: MaintenanceScheduler 实例
+        self.retriever = retriever  # 可选: PurposeDrivenRetriever 实例（完整 P 链路）
         self._next_node_id = self._compute_next_id()
 
     # ---- 序列化 ----
@@ -168,7 +169,35 @@ class DBAServer:
         return scored
 
     def query_memory(self, query: str, rerank_k: int = 20) -> dict:
-        """全链路检索：图谱扩展 + 内容匹配"""
+        """检索记忆：优先走完整 P 链路（跳转轴+目的回归+寻峰），否则关键词匹配"""
+        # 完整 P 链路（需要 LLM + embedding，由 main 构建 retriever）
+        if self.retriever:
+            try:
+                result = self.retriever.retrieve(query, seed_k=rerank_k)
+                memories = []
+                for mid, content in result.get("peak_memories", []):
+                    node = self.graph.graph.nodes.get(mid, {})
+                    nt = node.get("node_type")
+                    memories.append({
+                        "id": mid,
+                        "content": (content or "")[:200],
+                        "node_type": nt.value if hasattr(nt, "value") else str(nt),
+                        "deprecated": node.get("deprecated", False),
+                        "score": round(result.get("peak_scores", {}).get(mid, 0.0), 4),
+                    })
+                return {
+                    "memories": memories,
+                    "total_matched": result.get("total_candidates", 0),
+                    "returned": len(memories),
+                    "query": query,
+                    "purpose": result.get("purpose"),
+                    "method": "purpose_driven",
+                }
+            except Exception:
+                # 完整链路异常时回退到关键词匹配
+                pass
+
+        # 关键词匹配回退
         scored = self._search(query)
         results = []
         for nid, score in scored[:rerank_k]:
@@ -187,6 +216,7 @@ class DBAServer:
             "total_matched": len(scored),
             "returned": len(results),
             "query": query,
+            "method": "keyword_fuzzy",
         }
 
     def inspect_graph(self, node_id: str = None, topic: str = None, limit: int = 20) -> dict:
@@ -624,6 +654,32 @@ def _local_embeddings_available() -> bool:
         return False
 
 
+def _print_status(graph, dba, retriever, vector_ready, args) -> None:
+    """输出统一的状态日志，提醒用户当前运行模式与检索模式"""
+    mode = "完整 DBA" if dba else "存根"
+    retrieval = "P 链路（跳转轴+目的回归+寻峰）" if retriever else "关键词模糊匹配"
+    llm = args.llm_model or "未配置"
+    if args.embedding_model:
+        emb = f"{args.embedding_model}（{'本地' if args.embedding_local else 'API'}）"
+    else:
+        emb = "未配置"
+    transport = "SSE" if args.sse else "stdio"
+
+    print("=" * 60, file=sys.stderr)
+    print("[DBA MCP] 运行状态", file=sys.stderr)
+    print("=" * 60, file=sys.stderr)
+    print(f"  运行模式   : {mode}", file=sys.stderr)
+    print(f"  检索模式   : {retrieval}", file=sys.stderr)
+    print(f"  LLM        : {llm}", file=sys.stderr)
+    print(f"  Embedding  : {emb}", file=sys.stderr)
+    print(f"  向量索引   : {'已就绪' if vector_ready else '未启用'}", file=sys.stderr)
+    print(f"  传输模式   : {transport}", file=sys.stderr)
+    print(f"  图谱规模   : {graph.node_count} 节点 / {graph.edge_count} 边", file=sys.stderr)
+    print(f"  工具        : dba_add_conversation / dba_query_memory / dba_inspect_graph / "
+          f"dba_intervene / dba_checkpoint / dba_get_stats", file=sys.stderr)
+    print("=" * 60, file=sys.stderr)
+
+
 def main():
     if not HAS_MCP:
         print("错误: MCP SDK 未安装。请先运行: pip install mcp", file=sys.stderr)
@@ -662,6 +718,8 @@ def main():
     # 尝试构建 DBA 管线
     dba_instance = None
     scheduler_instance = None
+    retriever_instance = None
+    vector_ready = False
 
     # 前置检测：本地 embedding 依赖是否可用
     local_ok = True
@@ -726,12 +784,42 @@ def main():
             )
             scheduler_instance.on_checkpoint = lambda save_dir: dba_instance.save_checkpoint(save_dir)
 
-            print(f"[DBA MCP] DBA 管线就绪: LLM={args.llm_model}", file=sys.stderr)
+            # 完整检索链路（跳转轴 + 目的回归 + 寻峰终止），失败不影响 DBA 维护
+            if embeddings is not None:
+                try:
+                    from dba_pipeline.llm.inference import InferenceEngine
+                    from dba_pipeline.retrieval.retriever import PurposeDrivenRetriever
+
+                    # 启动时把当前图节点灌入向量存储（仅在索引为空时）
+                    if vector_store.store is None:
+                        mem_ids = [
+                            nid for nid in graph.graph.nodes()
+                            if graph.graph.nodes[nid].get("content")
+                        ]
+                        contents = [graph.graph.nodes[nid].get("content") for nid in mem_ids]
+                        if mem_ids:
+                            vector_store.add_memories(mem_ids, contents)
+
+                    inference = InferenceEngine(llm)
+                    retriever_instance = PurposeDrivenRetriever(
+                        llm=llm,
+                        embeddings=embeddings,
+                        graph=graph,
+                        vector_store=vector_store,
+                        inference=inference,
+                    )
+                    vector_ready = vector_store.store is not None
+                except Exception as e:
+                    print(f"[DBA MCP] 检索链路初始化失败（回退关键词匹配）: {e}", file=sys.stderr)
+
+            print(f"[DBA MCP] DBA 管线就绪: LLM={args.llm_model}, "
+                  f"检索={'P链路' if retriever_instance else '关键词'}", file=sys.stderr)
         except Exception as e:
             print(f"[DBA MCP] DBA 管线初始化失败: {e}", file=sys.stderr)
 
     dba_server = DBAServer(graph, yaml_path=args.yaml,
-                           dba=dba_instance, scheduler=scheduler_instance)
+                           dba=dba_instance, scheduler=scheduler_instance,
+                           retriever=retriever_instance)
 
     # P0: 启动调度器，维护完成后自动保存 YAML
     if scheduler_instance:
@@ -740,10 +828,8 @@ def main():
 
     server = create_mcp_server(dba_server)
 
-    print(f"[DBA MCP] 节点: {graph.node_count}, 边: {graph.edge_count}", file=sys.stderr)
-    print(f"[DBA MCP] 工具: dba_add_conversation{' (真实DBA)' if dba_instance else ' (存根)'}, "
-          f"dba_query_memory, dba_inspect_graph, dba_intervene, "
-          f"dba_checkpoint{' (完整)' if dba_instance else ''}, dba_get_stats", file=sys.stderr)
+    _print_status(graph=graph, dba=dba_instance, retriever=retriever_instance,
+                  vector_ready=vector_ready, args=args)
 
     if args.sse:
         import asyncio
