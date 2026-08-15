@@ -45,12 +45,14 @@ def load_graph(yaml_path: str) -> MemoryGraph:
 
     g = MemoryGraph()
 
-    # 加载节点
+    # 加载节点（补齐 deprecated / forgotten 状态，避免重启后丢失）
     for node in data["nodes"]:
         g.add_memory(
             memory_id=node["id"],
             content=node["content"],
             node_type=_NODE_TYPE_MAP[node["type"]],
+            deprecated=node.get("deprecated", False),
+            forgotten=node.get("forgotten", False),
         )
 
     # 加载边

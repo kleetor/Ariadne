@@ -369,18 +369,47 @@ class GraphBuilder:
     # ---- 去重 ----
 
     def _find_duplicate(self, content: str) -> Optional[str]:
-        """语义去重：检查 content 是否与已有节点高度相似"""
+        """语义去重：检查 content 是否与已有节点高度相似
+
+        - 无向量能力（store 为 None）时回退到精确字符串匹配，避免静默失效
+        - 有向量能力时用 FAISS 初筛 top-k 候选，再用缓存向量算精确余弦相似度
+        """
         if self.graph.node_count == 0:
             return None
 
-        results = self.vector_store.search(content, k=3)
-        for mid, score, _ in results:
-            # FAISS 返回 L2 距离，转为余弦相似度近似
-            similarity = 1.0 / (1.0 + score)
-            if similarity > self.dedup_threshold:
-                node = self.graph.get_node(mid)
-                if node and not node.get("deprecated"):
-                    return mid
+        # 无向量能力：回退精确字符串匹配
+        if self.vector_store.store is None:
+            for nid in self.graph.graph.nodes():
+                node = self.graph.get_node(nid)
+                if (node and not node.get("deprecated")
+                        and node.get("content") == content):
+                    logger.info(
+                        f"节点精确去重: '{content[:40]}...' → 已有节点 {nid}"
+                    )
+                    return nid
+            return None
+
+        # 有向量能力：FAISS 初筛 top-k，再用缓存向量算精确余弦
+        query_vec = self.vector_store._embed(content)
+        candidates = self.vector_store.search_by_vector(query_vec, k=3)
+
+        best_id, best_sim = None, 0.0
+        for mid, _ in candidates:
+            node = self.graph.get_node(mid)
+            if node is None or node.get("deprecated"):
+                continue
+            cand_vec = self.vector_store._content_vectors.get(mid)
+            if cand_vec is None:
+                continue
+            sim = float(
+                np.dot(query_vec, cand_vec)
+                / (np.linalg.norm(query_vec) * np.linalg.norm(cand_vec) + 1e-8)
+            )
+            if sim > best_sim:
+                best_sim, best_id = sim, mid
+
+        if best_id is not None and best_sim > self.dedup_threshold:
+            return best_id
         return None
 
     # ---- 孤立节点检测 ----

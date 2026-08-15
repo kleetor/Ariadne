@@ -20,11 +20,11 @@ class PeakFinder:
          但在 seen_decline 期间仍计入额外探索轮数
     """
 
-    def __init__(self, patience: int = 1, min_delta: float = 0.03,
+    def __init__(self, patience: int = 2, min_delta: float = 0.015,
                  peak_tolerance: float = 0.10):
         """
         Args:
-            patience: 首次下降后允许额外探索的轮数（默认 1 轮）
+            patience: 首次下降后允许额外探索的轮数（默认 2 轮）
             min_delta: 最小变化阈值，|Δμ| < min_delta 视为持平
             peak_tolerance: 峰值容忍常数，均值在 [peak-δ, peak] 内的轮都参与输出
         """

@@ -29,6 +29,7 @@ from typing import Optional
 from dba_pipeline.graph.memory_graph import MemoryGraph
 from dba_pipeline.loader import load_graph
 from dba_pipeline.core.jump_axis import NodeType, RelationType
+from dba_pipeline.core.path_tracker import PathTracker
 
 # ---- 可选 DBA 管线导入 ----
 try:
@@ -173,6 +174,9 @@ class DBAServer:
         # 完整 P 链路（需要 LLM + embedding，由 main 构建 retriever）
         if self.retriever:
             try:
+                # 每次检索视为一次联想会话，重置同会话饱和计数（跨会话终身增强保留）
+                if self.retriever.path_tracker is not None:
+                    self.retriever.path_tracker.start_session()
                 result = self.retriever.retrieve(query, seed_k=rerank_k)
                 memories = []
                 for mid, content in result.get("peak_memories", []):
@@ -776,13 +780,12 @@ def main():
                 graph_builder=builder,
             )
 
-            # Scheduler (with auto-checkpoint)
+            # Scheduler（异步批量维护）
             config = ScheduleConfig()
             scheduler_instance = MaintenanceScheduler(
                 dba=dba_instance,
                 config=config,
             )
-            scheduler_instance.on_checkpoint = lambda save_dir: dba_instance.save_checkpoint(save_dir)
 
             # 完整检索链路（跳转轴 + 目的回归 + 寻峰终止），失败不影响 DBA 维护
             if embeddings is not None:
@@ -801,12 +804,14 @@ def main():
                             vector_store.add_memories(mem_ids, contents)
 
                     inference = InferenceEngine(llm)
+                    path_tracker = PathTracker()
                     retriever_instance = PurposeDrivenRetriever(
                         llm=llm,
                         embeddings=embeddings,
                         graph=graph,
                         vector_store=vector_store,
                         inference=inference,
+                        path_tracker=path_tracker,
                     )
                     vector_ready = vector_store.store is not None
                 except Exception as e:

@@ -58,10 +58,6 @@ class ScheduleConfig:
     # DBA 连续判定"跳过"多少次后，不再调用 LLM，直接清空缓冲区
     auto_skip_threshold: int = 5
 
-    # ── 检查点 ──
-    # 自动检查点间隔（秒），0=关闭
-    auto_checkpoint_interval: float = 300.0  # 5 分钟
-
 
 class MaintenanceScheduler:
     """记忆图谱异步维护调度器
@@ -180,28 +176,6 @@ class MaintenanceScheduler:
         if "stats" in state:
             for k in self.stats:
                 self.stats[k] = state["stats"].get(k, self.stats[k])
-
-    # ---- 自动检查点 ----
-
-    def _start_auto_checkpoint(self):
-        """启动定时自动检查点（需先设置 on_checkpoint 回调）"""
-        if self.config.auto_checkpoint_interval <= 0:
-            return
-        self._checkpoint_timer = threading.Timer(
-            self.config.auto_checkpoint_interval, self._auto_checkpoint
-        )
-        self._checkpoint_timer.daemon = True
-        self._checkpoint_timer.start()
-
-    def _auto_checkpoint(self):
-        if not self._running:
-            return
-        if hasattr(self, "on_checkpoint") and self.on_checkpoint:
-            try:
-                self.on_checkpoint()
-            except Exception as e:
-                logger.error(f"自动检查点失败: {e}")
-        self._start_auto_checkpoint()  # 周期性重新调度
 
     # ---- 内部方法 ----
 
