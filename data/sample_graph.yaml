@@ -57,6 +57,9 @@ edges:
 - from: n2
   to: n3
   type: causal
+- from: n2
+  to: n5
+  type: causal
 - from: n3
   to: n4
   type: preference
