@@ -139,8 +139,8 @@ class PurposeDrivenRetriever:
         }]
 
         for hop in range(1, max_hops + 1):
-            # 跳转轴扩展（含可选 PathTracker 动态权重）
-            expanded = self.graph.expand(current_ids, path_tracker=self.path_tracker)
+            # 跳转轴扩展（含可选 PathTracker 动态权重 + 边来源追踪）
+            expanded = self.graph.expand_with_trace(current_ids, path_tracker=self.path_tracker)
 
             # 记录路径激活（供 PathTracker 分析）
             if self.path_tracker is not None:
@@ -169,18 +169,22 @@ class PurposeDrivenRetriever:
                 candidate_vectors, purpose_vec
             )
 
-            filtered: Dict[str, Tuple[str, float, float]] = {}
-            # {mem_id: (content, jump_weight, purpose_score)}
+            filtered: Dict[str, Dict] = {}
+            # {mem_id: {content, jump_weight, from, rel_type, is_reverse, purpose_score}}
             hop_threshold = self._get_hop_threshold(hop)
             for i, mid in enumerate(candidate_ids):
                 ps = float(candidate_scores[i])
                 if ps < hop_threshold:
                     continue
-                filtered[mid] = (
-                    candidate_contents[i],
-                    expanded[mid],
-                    ps,
-                )
+                trace = expanded[mid]
+                filtered[mid] = {
+                    "content": candidate_contents[i],
+                    "jump_weight": trace["weight"],
+                    "from": trace["from"],
+                    "rel_type": trace["rel_type"],
+                    "is_reverse": trace["is_reverse"],
+                    "purpose_score": ps,
+                }
 
             if not filtered:
                 result_ids = current_ids
@@ -189,12 +193,17 @@ class PurposeDrivenRetriever:
             # 距离衰减 + 组合得分
             decay = self.distance_decay ** hop
             combined = {}
-            for mid, (content, jw, ps) in filtered.items():
+            for mid, info in filtered.items():
+                jw = info["jump_weight"]
+                ps = info["purpose_score"]
                 combined[mid] = {
                     "id": mid,
-                    "content": content,
+                    "content": info["content"],
                     "jump_weight": jw,
                     "purpose_score": ps,
+                    "from": info["from"],
+                    "rel_type": info["rel_type"],
+                    "is_reverse": info["is_reverse"],
                     "combined_score": jw * decay * self.jump_weight_coef
                                       + ps * self.purpose_weight_coef,
                 }
@@ -283,37 +292,160 @@ class PurposeDrivenRetriever:
             "total_candidates": len(memories),
         }
 
-    def retrieve_with_response(
+    # ---- StoryRank：链路理解 → 故事片段 ----
+
+    @staticmethod
+    def _collect_trace_nodes(hop_history: List[Dict]) -> Dict:
+        """从 hop_history 提取节点信息与父子关系（树结构）
+
+        Returns:
+            {"parent": {child: parent}, "score": {id: combined_score},
+             "content": {id: content}, "edge": {child: (rel_type, is_reverse)}}
+        """
+        parent = {}
+        score = {}
+        content = {}
+        edge = {}
+        for h in hop_history:
+            for c in h.get("candidates", []):
+                cid = c.get("id")
+                if not cid:
+                    continue
+                score[cid] = c.get("combined_score", 0)
+                content[cid] = c.get("content", "")
+                frm = c.get("from")
+                if frm is not None:
+                    parent[cid] = frm
+                    edge[cid] = (c.get("rel_type"), c.get("is_reverse", False))
+        return {"parent": parent, "score": score, "content": content, "edge": edge}
+
+    def select_core_nodes(
+        self,
+        hop_history: List[Dict],
+        result_ids: List[str],
+    ) -> List[List[str]]:
+        """按连通性拆分核心节点组（粗筛）
+
+        每个结果节点沿 from 回溯到种子（根），共享根的结果归为一组；
+        组内节点按 hop 顺序（根 → 叶）排列。
+
+        Returns:
+            List[List[str]]：每个元素是一个片段的核心节点 id（从根到叶）
+        """
+        trace = self._collect_trace_nodes(hop_history)
+        parent = trace["parent"]
+        score = trace["score"]
+
+        def find_root(nid: str) -> str:
+            seen = set()
+            while nid in parent and nid not in seen:
+                seen.add(nid)
+                nid = parent[nid]
+            return nid
+
+        # 按根分组结果节点
+        groups: Dict[str, List[str]] = {}
+        for rid in result_ids:
+            if rid not in score:
+                continue
+            root = find_root(rid)
+            groups.setdefault(root, []).append(rid)
+
+        # 回溯收集每个分组的路径节点（结果 → 根），再按 hop 顺序排列（根 → 叶）
+        core_groups: List[List[str]] = []
+        for _, rids in groups.items():
+            core = set()
+            for rid in rids:
+                nid = rid
+                while nid is not None:
+                    core.add(nid)
+                    nid = parent.get(nid)
+            ordered = []
+            seen = set()
+            for h in hop_history:
+                for c in h.get("candidates", []):
+                    cid = c.get("id")
+                    if cid in core and cid not in seen:
+                        seen.add(cid)
+                        ordered.append(cid)
+            if ordered:
+                core_groups.append(ordered)
+
+        return core_groups
+
+    def _build_path(
+        self,
+        group: List[str],
+        hop_history: List[Dict],
+    ) -> Dict:
+        """把核心节点组构建成 StoryRank 的 path 结构（nodes + edges）"""
+        trace = self._collect_trace_nodes(hop_history)
+        parent = trace["parent"]
+        content = trace["content"]
+        edge = trace["edge"]
+        group_set = set(group)
+
+        nodes = []
+        for nid in group:
+            nt = self.graph.get_node_type(nid)
+            nt_val = nt.value if hasattr(nt, "value") else str(nt)
+            nodes.append({
+                "id": nid,
+                "content": content.get(nid) or self.graph.get_content(nid) or "",
+                "node_type": nt_val,
+            })
+
+        edges = []
+        for nid in group:
+            p = parent.get(nid)
+            if p is not None and p in group_set:
+                rel_type, is_reverse = edge.get(nid, (None, False))
+                rel_val = rel_type.value if hasattr(rel_type, "value") else str(rel_type)
+                edges.append({
+                    "from": p,
+                    "to": nid,
+                    "rel_type": rel_val,
+                    "is_reverse": is_reverse,
+                })
+
+        return {"nodes": nodes, "edges": edges}
+
+    def retrieve_with_story(
         self,
         query: str,
         seed_k: int = 5,
-        rerank_k: int = 8,
     ) -> Dict:
-        """检索 → LLM 联想重排序 → 截断 → 生成回复
+        """检索 → 连通性粗筛 → StoryRank 故事化 → 生成回复
 
-        Args:
-            query: 用户当前消息
-            seed_k: 向量检索种子数
-            rerank_k: 重排序后保留的 top-K 条记忆（0 = 仅排序不截断）
+        把检索得到的记忆因果链路理解成故事片段，替代原 rerank 的扁平重排序。
         """
         result = self.retrieve(query, seed_k=seed_k)
+        peak_memories = result.get("peak_memories", [])
+        hop_history = result.get("hop_history", [])
+        result_ids = [mid for mid, _ in peak_memories]
 
-        # 用 peak_scores 重排（确保 retrieve 阶段的排序顺序）
-        peak_memories = result["peak_memories"]  # [(id, content), ...]
-        peak_scores = result.get("peak_scores", {})
-        if peak_scores:
-            peak_memories.sort(key=lambda x: peak_scores.get(x[0], 0), reverse=True)
+        # 粗筛：按连通性拆分核心节点组
+        core_groups = self.select_core_nodes(hop_history, result_ids)
 
-        # LLM 联想视角重排序 + 截断
-        if peak_memories and rerank_k > 0 and len(peak_memories) > rerank_k:
-            reranked = self.inference.rerank_memories(query, peak_memories, top_k=rerank_k)
-            result["reranked_memories"] = reranked
-            result["reranked"] = True
-            context_items = [f"[{mid}] {content}" for mid, content in reranked]
-        else:
-            result["reranked"] = False
-            context_items = [f"[{mid}] {content}" for mid, content in peak_memories]
+        # 细筛 + 理解：每组生成一个故事片段
+        stories = []
+        story_nodes = []
+        discarded_nodes = []
+        for group in core_groups:
+            path = self._build_path(group, hop_history)
+            out = self.inference.story_rank(query, path)
+            story = out.get("story", "")
+            adopted = out.get("adopted_ids", [])
+            if story:
+                stories.append(story)
+            story_nodes.extend(adopted)
+            discarded_nodes.extend([nid for nid in group if nid not in adopted])
 
-        response = self.inference.generate_response(query, context_items)
-        result["response"] = response
+        result["stories"] = stories
+        result["story_nodes"] = story_nodes
+        result["discarded_nodes"] = discarded_nodes
+
+        # 生成回复：聊天 LLM 只接收干净故事，替代 [id] content 列举
+        context_items = [f"[记忆片段] {s}" for s in stories]
+        result["response"] = self.inference.generate_response(query, context_items)
         return result

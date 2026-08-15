@@ -41,38 +41,37 @@ PURPOSE_INFERENCE_PROMPT = ChatPromptTemplate.from_messages([
     ("human", "{query}"),
 ])
 
-# ---- 记忆联想 Rerank Prompt ----
+# ---- 记忆故事整理 StoryRank Prompt ----
 
-RERANK_PROMPT = ChatPromptTemplate.from_messages([
-    ("system", """你是一个记忆联想助手。用户说了一句话，你需要从候选记忆中选出用户**最可能自然联想到**的那些记忆。
+STORY_RANK_PROMPT = ChatPromptTemplate.from_messages([
+    ("system", """你是一个记忆故事整理助手。你会收到用户当前消息，以及一条「记忆因果链路」（由记忆节点和它们之间的关系构成）。
 
-判断标准（按优先级排序）：
-1. 因果链：这个记忆与用户当前状态有因果关系（导致了当前状态 / 是当前状态的结果）
-2. 功能等价：这个记忆在功能上与用户当前需求匹配（如用户想放松 → 散步/喝咖啡/听音乐）
-3. 情境关联：这个记忆与用户描述的场景属于同一情境（如加班场景 → 办公室/同事/咖啡）
-4. 时序关联：这个记忆在时间顺序上与用户描述的事件相邻
-
-注意：
-- 不要选只有关键词重叠但实际无关的记忆（"咖啡"→"意大利咖啡文化"不应该被联想）
-- 不要选过于宽泛的上位概念
-- 选你能确信"用户说这句话时自己也会想到"的记忆
+你的任务：
+1. 理解这条链路：每个节点是一个记忆片段（带类型），边表示节点之间的关系（带关系类型）。
+2. 把链路组织成一段连贯、自然的故事，让读者能顺畅理解用户的状态与经历。
+3. 关系语义要自然融入句子，例如：
+   - CAUSAL（因果）→ 因为 / 导致 / 所以
+   - SEQUENCE（时序）→ 然后 / 之后 / 接着
+   - PREFERENCE（偏好）→ 偏爱 / 喜欢
+   - SCENARIO（场景）→ 在…场景下 / 常去
+   - ATTRIBUTE（属性）→ 具有…特征
+   - TEMPORAL（时间）→ 时间上
+   - SOCIAL（社交）→ 与…有关
+   - TAXONOMIC（分类）→ 属于 / 是一种
+4. 只采纳与链路连贯的记忆；明显突兀、与主线无关的节点应舍弃，不出现在故事中。
+5. 忠实于节点内容，不编造未出现的事实。
 
 输出格式（严格 JSON）：
 {{
-    "ranked_ids": ["id1", "id2", ...],
-    "reasons": {{
-        "id1": "一句话简述联想理由",
-        "id2": "一句话简述联想理由"
-    }}
+    "story": "一段连贯的故事文本",
+    "adopted_ids": ["被采纳进故事的节点id", "..."]
 }}
-
-按联想自然度降序排列。未被选中的记忆不要出现在 ranked_ids 中。
 只输出 JSON。"""),
     ("human", """用户当前消息：
 {query}
 
-候选记忆：
-{memories}"""),
+记忆因果链路：
+{path}"""),
 ])
 
 # ---- 回复生成 Prompt ----
@@ -121,83 +120,57 @@ class InferenceEngine:
             logging.warning(f"目的推断 JSON 解析失败，原始响应: {response.content[:200]}")
             return {"status": "unknown", "purposes": ["理解"]}
 
-    def rerank_memories(
-        self,
-        query: str,
-        memories: List[tuple],  # [(memory_id, content), ...]
-        top_k: int = 8,
-    ) -> List[tuple]:
-        """LLM 联想视角重排序：选出用户最可能自然联想到的记忆
+    def story_rank(self, query: str, path: dict) -> dict:
+        """把一条检索因果链路理解成故事片段
 
         Args:
             query: 用户当前消息
-            memories: 候选记忆列表 [(memory_id, content), ...]
-            top_k: 保留 top-K 条（0 = 不截断，仅排序）
+            path: {"nodes": [{"id", "content", "node_type"}],
+                   "edges": [{"from", "to", "rel_type", "is_reverse"}]}
 
         Returns:
-            [(memory_id, content), ...] 按联想自然度降序
+            {"story": str, "adopted_ids": [id, ...]}
         """
         import json
         import logging
 
-        if not memories:
-            return []
+        nodes = path.get("nodes", [])
+        if not nodes:
+            return {"story": "", "adopted_ids": []}
 
-        # 格式化候选记忆
-        memory_lines = []
-        for mid, content in memories:
-            memory_lines.append(f"[{mid}] {content}")
-        memories_text = "\n".join(memory_lines)
+        # 格式化链路
+        lines = ["节点："]
+        for n in nodes:
+            nt = n.get("node_type", "")
+            lines.append(f'  [{n["id"]}]（{nt}）{n.get("content", "")}')
+        lines.append("关系：")
+        for e in path.get("edges", []):
+            rel = e.get("rel_type", "")
+            if e.get("is_reverse"):
+                lines.append(f'  [{e["to"]}] --{rel}--> [{e["from"]}]')
+            else:
+                lines.append(f'  [{e["from"]}] --{rel}--> [{e["to"]}]')
+        path_text = "\n".join(lines)
 
-        # 调用 LLM
-        chain = RERANK_PROMPT | self.llm
-        response = chain.invoke({
-            "query": query,
-            "memories": memories_text,
-        })
+        chain = STORY_RANK_PROMPT | self.llm
+        response = chain.invoke({"query": query, "path": path_text})
 
-        # 解析
+        all_ids = [n["id"] for n in nodes]
         try:
             cleaned = response.content.strip()
             if cleaned.startswith("```"):
-                lines = cleaned.split("\n")
-                lines = [l for l in lines if not l.startswith("```")]
-                cleaned = "\n".join(lines)
-            result = json.loads(cleaned)
-        except json.JSONDecodeError:
-            # fallback: 尝试正则提取
-            import re
-            ids_match = re.findall(r'"([^"]+)"', response.content)
-            logging.warning(f"Rerank JSON 解析失败，降级使用正则提取的 ID: {ids_match[:top_k] if ids_match else '无'}")
-            if ids_match:
-                result = {"ranked_ids": ids_match, "reasons": {}}
-            else:
-                return memories[:top_k] if top_k > 0 else memories
+                lines_ = cleaned.split("\n")
+                lines_ = [l for l in lines_ if not l.startswith("```")]
+                cleaned = "\n".join(lines_)
+            data = json.loads(cleaned)
+            story = data.get("story", "")
+            adopted = [str(a) for a in data.get("adopted_ids", []) if str(a) in all_ids]
+        except (json.JSONDecodeError, AttributeError):
+            logging.warning("StoryRank JSON 解析失败，降级为拼接节点内容")
+            story = " ".join(n.get("content", "") for n in nodes)
+            adopted = list(all_ids)
 
-        ranked_ids = result.get("ranked_ids", [])
-
-        # 按 LLM 输出顺序重排
-        id_to_memory = {mid: (mid, content) for mid, content in memories}
-        reranked = []
-        for mid in ranked_ids:
-            if mid in id_to_memory:
-                reranked.append(id_to_memory[mid])
-
-        # 补充 LLM 未提及的记忆（排在后面）
-        mentioned = set(ranked_ids)
-        for mid, content in memories:
-            if mid not in mentioned:
-                reranked.append((mid, content))
-
-        # 截断
-        if top_k > 0:
-            reranked = reranked[:top_k]
-
-        logger = logging.getLogger(__name__)
-        logger.info(f"Rerank: {len(memories)} → {len(reranked)} 条, "
-                    f"LLM选出 {len(ranked_ids)} 条, top_k={top_k}")
-
-        return reranked
+        return {"story": story, "adopted_ids": adopted}
 
     def generate_response(
         self,

@@ -8,7 +8,7 @@ LLM 驱动的记忆图谱构建、检索、可视化全链路管线。
 ## 架构
 
 ```
-对话日志 ──→ DBA维护 ──→ MemoryGraph + VectorStore ──→ P检索 ──→ Rerank ──→ 回复
+对话日志 ──→ DBA维护 ──→ MemoryGraph + VectorStore ──→ P检索 ──→ StoryRank ──→ 回复
    │            │                    │
    │     MaintenanceScheduler       ├──→ API Server (HTTP REST + 3D 面板)
    │     (批量异步调度)              ├──→ MCP Server (6 tools, stdio/SSE)
@@ -34,6 +34,16 @@ LLM 驱动的记忆图谱构建、检索、可视化全链路管线。
 | P 完整链路 | 有向 + 目的 + 寻峰 | 发散噪声、输出量膨胀 |
 
 核心优势在**召回深度**：216 节点上 P R@all=0.538 vs A=0.159（约 3.4 倍），且随规模放大。
+
+### StoryRank：检索链路的故事化（替代 Rerank）
+
+P 检索产出的是「节点 + 关系」构成的因果链路（而非扁平候选列表）。StoryRank 在送入回复生成前，把这条链路理解并整理成**故事片段文档**，承担三个职责：
+
+1. **保留因果关系**：关系类型（CAUSAL / PREFERENCE / SCENARIO 等）语义自然融入故事句子。
+2. **避免污染聊天 LLM 上下文**：聊天模型只接收干净故事，而非 `[id] content` 节点列举。
+3. **语义过滤**：LLM 按边关系组织故事时，明显突兀、与主线无关的节点被自然舍弃。
+
+入口为 `retrieve_with_story`（库内方法），产物含 `stories`、`story_nodes`（采纳节点）、`discarded_nodes`（舍弃节点）。
 
 > 详见 - [Ariadne——LLM DBA 管理与目的驱动的联想记忆检索系统（理论部分）](Ariadne——LLM%20DBA管理与目的驱动的联想记忆检索系统%20理论部分.md)
 
@@ -78,9 +88,6 @@ ariadne-api --yaml data/sample_graph.yaml --port 8765
 ### 2. MCP Server（供 LLM Agent 调用）
 
 ```bash
-# 存根模式：Agent 可查图/手动 CRUD，无需 LLM 配置
-ariadne-mcp --yaml data/sample_graph.yaml
-
 # 完整 DBA 模式：Agent 说话后自动抽取维护图谱（需 LLM + Embedding）
 ariadne-mcp --yaml data/sample_graph.yaml \
     --llm-model gpt-4o-mini --llm-api-key sk-xxx --llm-base-url https://api.openai.com/v1 \
@@ -127,14 +134,11 @@ EMBEDDING_MODEL=BAAI/bge-large-zh-v1.5
 EMBEDDING_LOCAL=true
 ```
 
-> 设了 `EMBEDDING_LOCAL=true` 需安装本地依赖 `pip install -e ".[local]"`；否则启动时会提示并回退到存根模式。
+> 设了 `EMBEDDING_LOCAL=true` 需安装本地依赖 `pip install -e ".[local]"`；否则启动时会报错退出。
 
-### 两种运行模式
+### 运行模式
 
-| 模式         | LLM 配置                                   | `dba_add_conversation` 行为 |
-| ---------- | ---------------------------------------- | ------------------------- |
-| **存根**     | 不需要                                      | 仅存储文本，不自动维护图谱             |
-| **完整 DBA** | 需 LLM 配置（`--llm-model` 或 `OPENAI_MODEL`） | 调用内部 LLM 抽取节点/边、纠错、废弃旧记忆  |
+当前仅保留**完整 DBA 模式**：需配置 LLM（`--llm-model` 或 `OPENAI_MODEL`），启动后 `dba_add_conversation` 会调用内部 LLM 抽取节点/边、纠错、废弃旧记忆。缺少 LLM / DBA 依赖时会直接报错退出（不再降级为存根模式）。
 
 > Agent 客户端的 LLM 与 Ariadne 内部的维护 LLM 是两个独立模型。Agent 的 LLM 负责理解意图、调用工具；Ariadne 的 LLM 负责把对话变成图谱事实。两者通过图谱（而非上下文窗口）共享记忆。
 
@@ -162,18 +166,18 @@ ariadne-mcp --yaml data.yaml --llm-model gpt-4o-mini --llm-api-key sk-xxx \
 
 | Tool                   | 说明                      |
 | ---------------------- | ----------------------- |
-| `dba_add_conversation` | 追加对话（存根仅存储，完整 DBA 触发维护） |
-| `dba_query_memory`     | 按关键词搜索记忆节点（支持多关键词、模糊匹配）   |
-| `dba_inspect_graph`    | 展开节点邻居 / 话题搜索           |
+| `dba_add_conversation` | 追加对话，触发 DBA 批量维护          |
+| `dba_query_memory`     | 目的驱动联想检索（P 链路：跳转轴 + 目的回归 + 寻峰） |
+| `dba_inspect_graph`    | 展开节点 1-hop 邻居             |
 | `dba_intervene`        | 人工 CRUD 节点和边            |
 | `dba_checkpoint`       | 保存完整检查点                 |
 | `dba_get_stats`        | 图谱统计信息                  |
 
 ### 检索说明（`dba_query_memory`）
 
-- 支持逗号分隔多关键词（如 `工作，公司，职业，上班`），任一关键词命中即返回。
-- 匹配分两级：精确子串得满分，否则按字符 bigram 相似度做模糊匹配。
-- `rerank_k` 控制返回上限（默认 20）；返回结果里 `total_matched` 是真实命中总数，`returned` 是本次实际返回数，若 `total_matched > returned` 可调大 `rerank_k` 取回剩余记忆。
+- 走完整 P 链路：跳转轴有向扩展 + 目的回归过滤 + 寻峰终止。
+- `rerank_k` 控制返回条数上限（rank-k，默认 20）；`total_matched` 是真实候选总数，`returned` 是本次实际返回数，若 `total_matched > returned` 可调大 `rerank_k` 取回剩余记忆。
+- 已废弃/遗忘的节点会被过滤，不出现在结果中。
 
 ### Agent 接入 JSON
 

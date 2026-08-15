@@ -152,6 +152,50 @@ class MemoryGraph:
 
         return scores
 
+    def expand_with_trace(
+        self,
+        seed_ids: List[str],
+        path_tracker=None,
+    ) -> Dict[str, Dict]:
+        """扩展一轮，并记录每条候选边的来源（父节点 + 关系类型 + 方向）
+
+        与 expand 语义一致：同一 neighbor 保留权重最高的来源边（树结构）。
+
+        Returns:
+            {neighbor_id: {"weight": float, "from": seed_id,
+                           "rel_type": RelationType, "is_reverse": bool}}
+        """
+        result: Dict[str, Dict] = {}
+
+        for seed_id in seed_ids:
+            source_type = self.get_node_type(seed_id)
+            if source_type is None:
+                continue
+
+            for neighbor_id, rel_type, is_reverse in self.get_neighbors(seed_id):
+                if neighbor_id in seed_ids:
+                    continue  # 不回访
+                w = get_jump_weight(source_type, rel_type, is_reverse)
+                if w <= 0:
+                    continue
+
+                # 注入 PathTracker 动态权重
+                if path_tracker is not None:
+                    dyn_mult = path_tracker.get_edge_weight_multiplier(
+                        seed_id, neighbor_id, rel_type.value
+                    )
+                    w *= dyn_mult
+
+                if neighbor_id not in result or w > result[neighbor_id]["weight"]:
+                    result[neighbor_id] = {
+                        "weight": w,
+                        "from": seed_id,
+                        "rel_type": rel_type,
+                        "is_reverse": is_reverse,
+                    }
+
+        return result
+
     def get_content(self, node_id: str) -> Optional[str]:
         """获取节点内容"""
         node = self.get_node(node_id)

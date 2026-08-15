@@ -188,8 +188,8 @@ snapshots/
 | Tool 名 | 输入 | 输出 | 说明 |
 |---------|------|------|------|
 | `dba_add_conversation` | `{conversation: str}` | `{maintained: bool, stats}` | 追加对话，触发维护（接入真实 DBA 时调用 `MemoryDBA.maintain()`） |
-| `dba_query_memory` | `{query: str, rerank_k?: int}` | `{memories: [...]}` | 全量节点内容匹配搜索 |
-| `dba_inspect_graph` | `{node_id?: str, topic?: str, limit?: int}` | `{nodes: [...], edges: [...]}` | 图谱查看（单节点 1-hop 展开或话题搜索） |
+| `dba_query_memory` | `{query: str, rerank_k?: int}` | `{memories: [...]}` | 目的驱动联想检索（P 链路：跳转轴 + 目的回归 + 寻峰） |
+| `dba_inspect_graph` | `{node_id: str}` | `{nodes: [...], edges: [...]}` | 图谱查看（单节点 1-hop 展开） |
 | `dba_intervene` | `{action: str, params: {...}}` | `{result, errors}` | 人工干预（create/update/delete 节点/边） |
 | `dba_checkpoint` | `{save_dir?: str}` | `{save_dir, stats}` | 保存完整检查点（图谱+向量+构建器+调度器状态） |
 | `dba_get_stats` | `{}` | `{stats}` | 系统统计（节点/边数、废弃数） |
@@ -339,7 +339,7 @@ Embedding 支持三种模式：
 - `graph_builder.py` — 操作执行与校验逻辑不变
 - `dba.py` — System Prompt 和上下文构建不变（新增 checkpoint/restore 方法）
 - `retriever.py` — P 检索逻辑不变
-- `inference.py` — Rerank 和状态推断不变
+- `inference.py` — 状态推断不变（Rerank 已重构为 StoryRank）
 - `src/core/jump_axis.py` — 跳转轴规则不变> *命名取自希腊神话：阿里阿德涅（Ariadne）将线团交给忒修斯，助其深入迷宫杀死牛头人后循线返回。*
 > 在 Ariadne 系统中：
 > - **记忆图谱 = 迷宫** — 复杂、深不可测的联想网络

@@ -145,7 +145,7 @@ class DBAServer:
             # 每次检索视为一次联想会话，重置同会话饱和计数（跨会话终身增强保留）
             if self.retriever.path_tracker is not None:
                 self.retriever.path_tracker.start_session()
-            result = self.retriever.retrieve(query, seed_k=rerank_k)
+            result = self.retriever.retrieve(query)  # seed_k 用默认值；rerank_k 仅控制返回条数
             memories = []
             for mid, content in result.get("peak_memories", []):
                 node = self.graph.graph.nodes.get(mid, {})
@@ -159,6 +159,9 @@ class DBAServer:
                     "deprecated": False,
                     "score": round(result.get("peak_scores", {}).get(mid, 0.0), 4),
                 })
+            # rank-k：最多返回 rerank_k 条记忆（0 表示不截断）
+            if rerank_k > 0:
+                memories = memories[:rerank_k]
             return {
                 "memories": memories,
                 "total_matched": result.get("total_candidates", 0),
