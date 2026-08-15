@@ -15,11 +15,16 @@ Usage:
     pip install mcp
 """
 
+import os
+
+# 避免 torch 与 FAISS 的 OpenMP 运行时冲突导致进程 Aborted
+os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
+
 import argparse
 import json
-import os
-import re
+import logging
 import sys
+import threading
 from pathlib import Path
 from typing import Optional
 
@@ -28,7 +33,7 @@ from typing import Optional
 
 from dba_pipeline.graph.memory_graph import MemoryGraph
 from dba_pipeline.loader import load_graph
-from dba_pipeline.core.jump_axis import NodeType, RelationType
+from dba_pipeline.core.jump_axis import NodeType, RelationType, get_jump_weight
 from dba_pipeline.core.path_tracker import PathTracker
 
 # ---- 可选 DBA 管线导入 ----
@@ -58,46 +63,20 @@ NODE_TYPES = {t.value.upper(): t for t in NodeType}
 REL_TYPES = {t.value: t for t in RelationType}
 
 
-def _split_keywords(query: str) -> list:
-    """将查询拆分为多个关键词，支持中英文逗号、顿号、分号、空格等分隔。"""
-    return [kw for kw in re.split(r"[,，、;；。.！!？?\s]+", query or "") if kw]
-
-
-def _bigrams(text: str) -> set:
-    """生成字符 bigram 集合，用于中文模糊匹配。"""
-    text = re.sub(r"\s+", "", text)
-    if not text:
-        return set()
-    if len(text) == 1:
-        return {text}
-    return {text[i:i + 2] for i in range(len(text) - 1)}
-
-
-def _fuzzy_score(keyword: str, content: str) -> float:
-    """关键词与内容的匹配分数：精确子串得满分，否则按字符 bigram 相似度。"""
-    kw = (keyword or "").lower()
-    c = (content or "").lower()
-    if not kw:
-        return 0.0
-    if kw in c:
-        return 1.0
-    k_bigrams = _bigrams(kw)
-    c_bigrams = _bigrams(c)
-    if not k_bigrams or not c_bigrams:
-        return 0.0
-    return len(k_bigrams & c_bigrams) / len(k_bigrams | c_bigrams)
-
-
 class DBAServer:
     """DBA 核心逻辑，与 MCP 协议层解耦"""
 
     def __init__(self, graph: MemoryGraph, yaml_path: str = None,
-                 dba=None, scheduler=None, retriever=None):
+                 dba=None, scheduler=None, retriever=None, vector_store=None,
+                 lock=None):
         self.graph = graph
         self.yaml_path = yaml_path
         self.dba = dba          # 可选: MemoryDBA 实例
         self.scheduler = scheduler  # 可选: MaintenanceScheduler 实例
         self.retriever = retriever  # 可选: PurposeDrivenRetriever 实例（完整 P 链路）
+        self.vector_store = vector_store  # 可选: VectorStore（人工干预时同步向量）
+        # 可重入锁，与 GraphBuilder 共享，串行化 graph 修改与 YAML 写回
+        self._lock = lock if lock is not None else threading.RLock()
         self._next_node_id = self._compute_next_id()
 
     # ---- 序列化 ----
@@ -105,10 +84,11 @@ class DBAServer:
     def _save(self):
         if not self.yaml_path:
             return
-        import yaml
-        data = self.graph.to_dict()
-        with open(self.yaml_path, "w", encoding="utf-8") as f:
-            yaml.dump(data, f, allow_unicode=True, default_flow_style=False, sort_keys=False)
+        with self._lock:
+            import yaml
+            data = self.graph.to_dict()
+            with open(self.yaml_path, "w", encoding="utf-8") as f:
+                yaml.dump(data, f, allow_unicode=True, default_flow_style=False, sort_keys=False)
 
     def _compute_next_id(self) -> int:
         max_id = 0
@@ -153,159 +133,136 @@ class DBAServer:
                 }
         return {
             "maintained": False,
-            "message": "conversation stored, DBA pipeline not wired (stub)",
-            "conversation_length": len(conversation),
+            "error": "DBA pipeline not wired",
         }
-
-    def _search(self, query: str) -> list:
-        """关键词模糊检索，返回按匹配分数降序的 [(node_id, score), ...]"""
-        keywords = _split_keywords(query) or [query]
-        scored = []
-        for nid in self.graph.graph.nodes():
-            content = self.graph.graph.nodes[nid].get("content", "")
-            score = max(_fuzzy_score(kw, content) for kw in keywords)
-            if score > 0:
-                scored.append((nid, score))
-        scored.sort(key=lambda x: x[1], reverse=True)
-        return scored
 
     def query_memory(self, query: str, rerank_k: int = 20) -> dict:
-        """检索记忆：优先走完整 P 链路（跳转轴+目的回归+寻峰），否则关键词匹配"""
-        # 完整 P 链路（需要 LLM + embedding，由 main 构建 retriever）
-        if self.retriever:
-            try:
-                # 每次检索视为一次联想会话，重置同会话饱和计数（跨会话终身增强保留）
-                if self.retriever.path_tracker is not None:
-                    self.retriever.path_tracker.start_session()
-                result = self.retriever.retrieve(query, seed_k=rerank_k)
-                memories = []
-                for mid, content in result.get("peak_memories", []):
-                    node = self.graph.graph.nodes.get(mid, {})
-                    nt = node.get("node_type")
-                    memories.append({
-                        "id": mid,
-                        "content": (content or "")[:200],
-                        "node_type": nt.value if hasattr(nt, "value") else str(nt),
-                        "deprecated": node.get("deprecated", False),
-                        "score": round(result.get("peak_scores", {}).get(mid, 0.0), 4),
-                    })
-                return {
-                    "memories": memories,
-                    "total_matched": result.get("total_candidates", 0),
-                    "returned": len(memories),
-                    "query": query,
-                    "purpose": result.get("purpose"),
-                    "method": "purpose_driven",
-                }
-            except Exception:
-                # 完整链路异常时回退到关键词匹配
-                pass
+        """检索记忆：走完整 P 链路（跳转轴+目的回归+寻峰）"""
+        if self.retriever is None:
+            return {"error": "检索链路未初始化（需要 embedding）", "memories": []}
 
-        # 关键词匹配回退
-        scored = self._search(query)
-        results = []
-        for nid, score in scored[:rerank_k]:
-            node = self.graph.graph.nodes[nid]
-            nt = node.get("node_type")
-            results.append({
-                "id": nid,
-                "content": node.get("content", "")[:200],
-                "node_type": nt.value if hasattr(nt, "value") else str(nt),
-                "deprecated": node.get("deprecated", False),
-                "score": round(score, 4),
-            })
+        try:
+            # 每次检索视为一次联想会话，重置同会话饱和计数（跨会话终身增强保留）
+            if self.retriever.path_tracker is not None:
+                self.retriever.path_tracker.start_session()
+            result = self.retriever.retrieve(query, seed_k=rerank_k)
+            memories = []
+            for mid, content in result.get("peak_memories", []):
+                node = self.graph.graph.nodes.get(mid, {})
+                if node.get("deprecated") or node.get("forgotten"):
+                    continue  # 过滤已废弃/遗忘的记忆
+                nt = node.get("node_type")
+                memories.append({
+                    "id": mid,
+                    "content": (content or "")[:200],
+                    "node_type": nt.value if hasattr(nt, "value") else str(nt),
+                    "deprecated": False,
+                    "score": round(result.get("peak_scores", {}).get(mid, 0.0), 4),
+                })
+            return {
+                "memories": memories,
+                "total_matched": result.get("total_candidates", 0),
+                "returned": len(memories),
+                "query": query,
+                "purpose": result.get("purpose"),
+                "method": "purpose_driven",
+            }
+        except Exception as e:
+            logging.error(f"P 链路检索失败: {e}", exc_info=True)
+            return {"error": str(e), "memories": [], "method": "purpose_driven_failed"}
 
-        return {
-            "memories": results,
-            "total_matched": len(scored),
-            "returned": len(results),
-            "query": query,
-            "method": "keyword_fuzzy",
-        }
+    def inspect_graph(self, node_id: str = None) -> dict:
+        """查看图谱：指定节点展开 1-hop 邻居"""
+        if not node_id:
+            return {"error": "缺少 node_id"}
+        if node_id not in self.graph.graph.nodes:
+            return {"error": f"节点不存在: {node_id}"}
 
-    def inspect_graph(self, node_id: str = None, topic: str = None, limit: int = 20) -> dict:
-        """查看图谱：单节点邻居展开 或 话题搜索"""
+        nid = node_id
         nodes = []
         edges = []
+        seen_nodes = {nid}
 
-        if node_id and node_id in self.graph.graph.nodes:
-            nid = node_id
-            node = self.graph.graph.nodes[nid]
-            nt = node.get("node_type")
-            nodes.append({
-                "id": nid,
-                "content": node.get("content", ""),
-                "node_type": nt.value if hasattr(nt, "value") else str(nt),
-                "deprecated": node.get("deprecated", False),
-                "forgotten": node.get("forgotten", False),
-            })
+        node = self.graph.graph.nodes[nid]
+        nt = node.get("node_type")
+        nodes.append({
+            "id": nid,
+            "content": node.get("content", ""),
+            "node_type": nt.value if hasattr(nt, "value") else str(nt),
+            "deprecated": node.get("deprecated", False),
+            "forgotten": node.get("forgotten", False),
+        })
 
-            # 出边
-            for _, tgt, edata in self.graph.graph.out_edges(nid, data=True):
-                rt = edata["rel_type"]
-                tgt_node = self.graph.graph.nodes[tgt]
-                tgt_nt = tgt_node.get("node_type")
+        # 出边
+        for _, tgt, edata in self.graph.graph.out_edges(nid, data=True):
+            rt = edata["rel_type"]
+            tgt_node = self.graph.graph.nodes[tgt]
+            tgt_nt = tgt_node.get("node_type")
+            if tgt not in seen_nodes:
+                seen_nodes.add(tgt)
                 nodes.append({
                     "id": tgt,
                     "content": tgt_node.get("content", ""),
                     "node_type": tgt_nt.value if hasattr(tgt_nt, "value") else str(tgt_nt),
                 })
-                edges.append({
-                    "from": nid,
-                    "to": tgt,
-                    "type": rt.value if hasattr(rt, "value") else str(rt),
-                })
+            edges.append({
+                "from": nid,
+                "to": tgt,
+                "type": rt.value if hasattr(rt, "value") else str(rt),
+            })
 
-            # 入边
-            for src, _, edata in self.graph.graph.in_edges(nid, data=True):
-                rt = edata["rel_type"]
-                src_node = self.graph.graph.nodes[src]
-                src_nt = src_node.get("node_type")
+        # 入边
+        for src, _, edata in self.graph.graph.in_edges(nid, data=True):
+            rt = edata["rel_type"]
+            src_node = self.graph.graph.nodes[src]
+            src_nt = src_node.get("node_type")
+            if src not in seen_nodes:
+                seen_nodes.add(src)
                 nodes.append({
                     "id": src,
                     "content": src_node.get("content", ""),
                     "node_type": src_nt.value if hasattr(src_nt, "value") else str(src_nt),
                 })
-                edges.append({
-                    "from": src,
-                    "to": nid,
-                    "type": rt.value if hasattr(rt, "value") else str(rt),
-                })
-
-        elif topic:
-            # 话题搜索：在所有节点内容中模糊匹配
-            matched = []
-            for nid, _score in self._search(topic)[:limit]:
-                node = self.graph.graph.nodes[nid]
-                nt = node.get("node_type")
-                matched.append({
-                    "id": nid,
-                    "content": node.get("content", "")[:200],
-                    "node_type": nt.value if hasattr(nt, "value") else str(nt),
-                })
-            nodes = matched
+            edges.append({
+                "from": src,
+                "to": nid,
+                "type": rt.value if hasattr(rt, "value") else str(rt),
+            })
 
         return {"nodes": nodes, "edges": edges}
 
     def intervene(self, action: str, params: dict) -> dict:
-        """人工干预 CRUD 操作"""
+        """人工干预 CRUD 操作（与 GraphBuilder 行为对齐，锁保护）"""
+        with self._lock:
+            return self._intervene_impl(action, params)
+
+    def _intervene_impl(self, action: str, params: dict) -> dict:
+        """intervene 实际实现（在锁内调用）"""
         result = {"action": action, "success": True}
         try:
             if action == "create_node":
                 nt = NODE_TYPES.get(params.get("node_type", "").upper())
                 if not nt:
                     return {"error": f"无效的节点类型: {params.get('node_type')}"}
+                content = params.get("content", "")
                 nid = f"n{self._next_node_id}"
                 self._next_node_id += 1
                 self.graph.graph.add_node(
                     nid,
-                    content=params.get("content", ""),
+                    content=content,
                     node_type=nt,
                     metadata={},
                     deprecated=False,
                     forgotten=False,
                 )
-                result["node"] = {"id": nid, "content": params.get("content", ""),
+                # 同步向量库，使人工创建的节点可被 P 链路检索
+                if self.vector_store is not None:
+                    try:
+                        self.vector_store.add_memories([nid], [content])
+                    except Exception:
+                        self.graph.graph.remove_node(nid)
+                        raise
+                result["node"] = {"id": nid, "content": content,
                                   "node_type": params.get("node_type", "").upper()}
                 self._save()
 
@@ -316,10 +273,17 @@ class DBAServer:
                 node = self.graph.graph.nodes[nid]
                 if "content" in params:
                     node["content"] = params["content"]
+                    # 同步向量（与 GraphBuilder 一致）
+                    if self.vector_store is not None:
+                        try:
+                            self.vector_store.update_memories([nid], [params["content"]])
+                        except Exception:
+                            pass
                 if "node_type" in params:
                     nt = NODE_TYPES.get(params["node_type"].upper())
-                    if nt:
-                        node["node_type"] = nt
+                    if not nt:
+                        return {"error": f"无效的节点类型: {params['node_type']}"}
+                    node["node_type"] = nt
                 if "deprecated" in params:
                     node["deprecated"] = bool(params["deprecated"])
                 result["node"] = {"id": nid, "content": node.get("content", "")}
@@ -340,9 +304,21 @@ class DBAServer:
                     return {"error": f"无效的边类型: {params.get('rel_type')}"}
                 if src == tgt:
                     return {"error": "不能创建自环边"}
+                if src not in self.graph.graph.nodes:
+                    return {"error": f"源节点不存在: {src}"}
+                if tgt not in self.graph.graph.nodes:
+                    return {"error": f"目标节点不存在: {tgt}"}
+                # 跳转轴权重校验：权重为 0 的方向不允许建边
+                src_type = self.graph.get_node_type(src)
+                if src_type and get_jump_weight(src_type, rt, is_reverse=False) <= 0:
+                    return {"error": f"边 {src}--[{rt.value}]-->{tgt} 在该节点类型上权重为 0，不允许创建"}
                 if self.graph.graph.has_edge(src, tgt):
                     return {"error": f"边已存在: {src} -> {tgt}"}
                 self.graph.graph.add_edge(src, tgt, rel_type=rt)
+                # 双向类型自动补反向边
+                if rt in (RelationType.SCENARIO, RelationType.SOCIAL, RelationType.ATTRIBUTE):
+                    if not self.graph.graph.has_edge(tgt, src):
+                        self.graph.graph.add_edge(tgt, src, rel_type=rt)
                 result["edge"] = {"source": src, "target": tgt, "rel_type": params["rel_type"]}
                 self._save()
 
@@ -350,7 +326,12 @@ class DBAServer:
                 src, tgt = params["source"], params["target"]
                 if not self.graph.graph.has_edge(src, tgt):
                     return {"error": f"边不存在: {src} -> {tgt}"}
+                rt = self.graph.graph.edges[src, tgt].get("rel_type")
                 self.graph.graph.remove_edge(src, tgt)
+                # 双向类型同步删除反向边
+                if rt in (RelationType.SCENARIO, RelationType.SOCIAL, RelationType.ATTRIBUTE):
+                    if self.graph.graph.has_edge(tgt, src):
+                        self.graph.graph.remove_edge(tgt, src)
                 result["deleted"] = f"{src} -> {tgt}"
                 self._save()
 
@@ -406,13 +387,20 @@ class DBAServer:
         nodes = list(self.graph.graph.nodes(data=True))
         deprecated = sum(1 for _, d in nodes if d.get("deprecated"))
         forgotten = sum(1 for _, d in nodes if d.get("forgotten"))
+
+        node_types = {}
+        for _, d in nodes:
+            nt = d.get("node_type")
+            key = nt.value if hasattr(nt, "value") else str(nt)
+            node_types[key] = node_types.get(key, 0) + 1
+
         return {
             "total_nodes": len(nodes),
             "total_edges": self.graph.edge_count,
             "deprecated": deprecated,
             "forgotten": forgotten,
             "active": len(nodes) - deprecated - forgotten,
-            "node_types": {},
+            "node_types": node_types,
         }
 
 
@@ -448,11 +436,11 @@ TOOL_SCHEMAS = [
             "properties": {
                 "query": {
                     "type": "string",
-                    "description": "搜索关键词，支持逗号分隔多个关键词（如：工作，公司，职业，上班），任一关键词命中即返回",
+                    "description": "查询文本，用于联想检索相关的记忆节点",
                 },
                 "rerank_k": {
                     "type": "integer",
-                    "description": "最多返回的节点数（默认 20）。返回结果里的 total_matched 是真实命中总数，若大于 returned 可调大此值获取剩余记忆",
+                    "description": "最多返回的节点数（默认 20）",
                 },
             },
             "required": ["query"],
@@ -460,7 +448,7 @@ TOOL_SCHEMAS = [
     },
     {
         "name": "dba_inspect_graph",
-        "description": "查看图谱：指定节点展开邻居，或按话题搜索节点",
+        "description": "查看图谱：指定节点展开 1-hop 邻居",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -468,15 +456,8 @@ TOOL_SCHEMAS = [
                     "type": "string",
                     "description": "节点 ID（如 n12），展开其 1-hop 邻居",
                 },
-                "topic": {
-                    "type": "string",
-                    "description": "搜索话题关键词，匹配节点内容",
-                },
-                "limit": {
-                    "type": "integer",
-                    "description": "最多返回的节点数（默认 20）",
-                },
             },
+            "required": ["node_id"],
         },
     },
     {
@@ -659,9 +640,8 @@ def _local_embeddings_available() -> bool:
 
 
 def _print_status(graph, dba, retriever, vector_ready, args) -> None:
-    """输出统一的状态日志，提醒用户当前运行模式与检索模式"""
-    mode = "完整 DBA" if dba else "存根"
-    retrieval = "P 链路（跳转轴+目的回归+寻峰）" if retriever else "关键词模糊匹配"
+    """输出统一的状态日志"""
+    retrieval = "P 链路（跳转轴+目的回归+寻峰）" if retriever else "未启用"
     llm = args.llm_model or "未配置"
     if args.embedding_model:
         emb = f"{args.embedding_model}（{'本地' if args.embedding_local else 'API'}）"
@@ -672,7 +652,6 @@ def _print_status(graph, dba, retriever, vector_ready, args) -> None:
     print("=" * 60, file=sys.stderr)
     print("[DBA MCP] 运行状态", file=sys.stderr)
     print("=" * 60, file=sys.stderr)
-    print(f"  运行模式   : {mode}", file=sys.stderr)
     print(f"  检索模式   : {retrieval}", file=sys.stderr)
     print(f"  LLM        : {llm}", file=sys.stderr)
     print(f"  Embedding  : {emb}", file=sys.stderr)
@@ -713,27 +692,36 @@ def main():
     parser.add_argument("--embedding-local", action="store_true",
                         default=_env_flag("EMBEDDING_LOCAL"),
                         help="使用本地 sentence-transformers 模型（默认读环境变量 EMBEDDING_LOCAL）")
-    parser.add_argument("--vector-dir", default=None, help="向量索引持久化目录")
+    parser.add_argument("--vector-index", default=None, help="FAISS 索引文件路径（可选，用于恢复向量索引）")
+    parser.add_argument("--restore-dir", default=None, help="从 checkpoint 目录完整恢复（图谱+向量+构建器+调度器状态）")
     args = parser.parse_args()
 
     print(f"[DBA MCP] 加载图数据: {args.yaml}", file=sys.stderr)
     graph = load_graph(args.yaml)
 
-    # 尝试构建 DBA 管线
+    # 共享锁：串行化 graph 修改（DBA 维护 + 人工干预）
+    graph_lock = threading.RLock()
+
+    # 构建 DBA 管线
     dba_instance = None
     scheduler_instance = None
     retriever_instance = None
+    vector_store = None
     vector_ready = False
 
-    # 前置检测：本地 embedding 依赖是否可用
-    local_ok = True
+    # 只保留完整 DBA 链路：缺少 LLM / DBA 依赖 / 本地 embedding 依赖时直接退出
+    if not args.llm_model:
+        print("错误: 需要配置 LLM（--llm-model 或环境变量 OPENAI_MODEL）", file=sys.stderr)
+        sys.exit(1)
+    if not HAS_DBA:
+        print("错误: DBA 管线依赖未安装（langchain 等），无法启动", file=sys.stderr)
+        sys.exit(1)
     if args.embedding_model and args.embedding_local and not _local_embeddings_available():
-        local_ok = False
-        print("[DBA MCP] 警告: EMBEDDING_LOCAL=true 但未安装 sentence-transformers。", file=sys.stderr)
-        print("[DBA MCP] 请安装本地依赖后再启动: pip install -e \".[local]\"", file=sys.stderr)
-        print("[DBA MCP] 当前将回退到存根模式（不启用真实 DBA 维护）。", file=sys.stderr)
+        print("错误: EMBEDDING_LOCAL=true 但未安装 sentence-transformers。", file=sys.stderr)
+        print("请安装本地依赖后再启动: pip install -e \".[local]\"", file=sys.stderr)
+        sys.exit(1)
 
-    if args.llm_model and HAS_DBA and local_ok:
+    if args.llm_model and HAS_DBA:
         print("[DBA MCP] 构建 DBA 管线...", file=sys.stderr)
         try:
             from dba_pipeline.extraction.maintenance_scheduler import MaintenanceScheduler, ScheduleConfig
@@ -755,14 +743,14 @@ def main():
             vector_store = VectorStore(
                 embeddings=embeddings,
                 backend="faiss",
-                persist_dir=args.vector_dir,
+                persist_dir=None,
             )
-            if args.vector_dir:
-                if os.path.exists(args.vector_dir):
-                    vector_store.load(args.vector_dir, embeddings=embeddings)
+            if args.vector_index:
+                if os.path.exists(args.vector_index):
+                    vector_store.load(args.vector_index, embeddings=embeddings)
 
             # GraphBuilder
-            builder = GraphBuilder(graph=graph, vector_store=vector_store)
+            builder = GraphBuilder(graph=graph, vector_store=vector_store, lock=graph_lock)
 
             # LLM
             llm = ChatOpenAI(
@@ -815,16 +803,33 @@ def main():
                     )
                     vector_ready = vector_store.store is not None
                 except Exception as e:
-                    print(f"[DBA MCP] 检索链路初始化失败（回退关键词匹配）: {e}", file=sys.stderr)
+                    print(f"[DBA MCP] 检索链路初始化失败（检索不可用）: {e}", file=sys.stderr)
 
             print(f"[DBA MCP] DBA 管线就绪: LLM={args.llm_model}, "
-                  f"检索={'P链路' if retriever_instance else '关键词'}", file=sys.stderr)
+                  f"检索={'P链路' if retriever_instance else '未启用'}", file=sys.stderr)
         except Exception as e:
             print(f"[DBA MCP] DBA 管线初始化失败: {e}", file=sys.stderr)
 
     dba_server = DBAServer(graph, yaml_path=args.yaml,
                            dba=dba_instance, scheduler=scheduler_instance,
-                           retriever=retriever_instance)
+                           retriever=retriever_instance, vector_store=vector_store,
+                           lock=graph_lock)
+
+    # 完整恢复 checkpoint（如果指定）
+    if args.restore_dir and dba_instance:
+        try:
+            dba_instance.restore_checkpoint(args.restore_dir)
+            if scheduler_instance:
+                sched_path = os.path.join(args.restore_dir, "scheduler_state.json")
+                if os.path.exists(sched_path):
+                    import json as _json
+                    with open(sched_path, encoding="utf-8") as f:
+                        scheduler_instance.load_state(_json.load(f))
+            dba_server._next_node_id = dba_server._compute_next_id()
+            print(f"[DBA MCP] 已从 checkpoint 恢复: {args.restore_dir}", file=sys.stderr)
+        except Exception as e:
+            print(f"[DBA MCP] checkpoint 恢复失败: {e}", file=sys.stderr)
+            sys.exit(1)
 
     # P0: 启动调度器，维护完成后自动保存 YAML
     if scheduler_instance:

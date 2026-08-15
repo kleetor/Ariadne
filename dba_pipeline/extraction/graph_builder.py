@@ -82,6 +82,7 @@ class GraphBuilder:
         vector_store: VectorStore,
         dedup_threshold: float = 0.85,
         orphan_threshold: int = 3,
+        lock=None,
     ):
         """
         Args:
@@ -89,11 +90,13 @@ class GraphBuilder:
             vector_store: 向量存储（用于语义去重）
             dedup_threshold: 语义去重余弦阈值（默认 0.85，生产系统已验证）
             orphan_threshold: 连续多少次维护后仍为孤立节点则遗忘
+            lock: 可选的共享锁（RLock），用于串行化 graph 修改（与 DBAServer 共享）
         """
         self.graph = graph
         self.vector_store = vector_store
         self.dedup_threshold = dedup_threshold
         self.orphan_threshold = orphan_threshold
+        self._lock = lock
 
         # 孤立节点追踪: {node_id: consecutive_orphan_count}
         self._orphan_tracker: Dict[str, int] = {}
@@ -117,7 +120,18 @@ class GraphBuilder:
         node_ops: List[Dict],
         edge_ops: List[Dict],
     ) -> Dict:
-        """执行 LLM DBA 输出的操作指令（带事务保护）
+        """执行 LLM DBA 输出的操作指令（带事务保护 + 锁保护）"""
+        if self._lock is None:
+            return self._apply_ops_impl(node_ops, edge_ops)
+        with self._lock:
+            return self._apply_ops_impl(node_ops, edge_ops)
+
+    def _apply_ops_impl(
+        self,
+        node_ops: List[Dict],
+        edge_ops: List[Dict],
+    ) -> Dict:
+        """apply_ops 实际实现（在锁内调用）
 
         Args:
             node_ops: 节点操作列表 [{"action": "create", ...}, ...]
@@ -246,7 +260,7 @@ class GraphBuilder:
 
         # 更新向量库（失败时回滚 content）
         try:
-            self.vector_store.add_memories([target_id], [new_content])
+            self.vector_store.update_memories([target_id], [new_content])
         except Exception:
             self.graph.graph.nodes[target_id]["content"] = old_content
             raise

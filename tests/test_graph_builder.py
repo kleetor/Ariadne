@@ -30,6 +30,10 @@ class FakeVectorStore:
             raise RuntimeError("add_memories failed")
         self.added.extend(memory_ids)
 
+    def update_memories(self, memory_ids, contents):
+        for mid, content in zip(memory_ids, contents):
+            self._content_vectors[mid] = self._embed(content)
+
 
 def _builder(store=None, vectors=None, orphan_threshold=3):
     graph = MemoryGraph()
