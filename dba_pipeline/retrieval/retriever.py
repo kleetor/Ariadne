@@ -306,6 +306,7 @@ class PurposeDrivenRetriever:
         score = {}
         content = {}
         edge = {}
+        seen = set()
         for h in hop_history:
             for c in h.get("candidates", []):
                 cid = c.get("id")
@@ -313,6 +314,10 @@ class PurposeDrivenRetriever:
                     continue
                 score[cid] = c.get("combined_score", 0)
                 content[cid] = c.get("content", "")
+                # 节点首次出现时才记录父边；回访（如双向边折返）不更新，避免 parent 成环
+                if cid in seen:
+                    continue
+                seen.add(cid)
                 frm = c.get("from")
                 if frm is not None:
                     parent[cid] = frm
@@ -357,7 +362,9 @@ class PurposeDrivenRetriever:
             core = set()
             for rid in rids:
                 nid = rid
-                while nid is not None:
+                seen_loop = set()
+                while nid is not None and nid not in seen_loop:
+                    seen_loop.add(nid)
                     core.add(nid)
                     nid = parent.get(nid)
             ordered = []
@@ -414,8 +421,9 @@ class PurposeDrivenRetriever:
         self,
         query: str,
         seed_k: int = 5,
+        with_response: bool = True,
     ) -> Dict:
-        """检索 → 连通性粗筛 → StoryRank 故事化 → 生成回复
+        """检索 → 连通性粗筛 → StoryRank 故事化 →（可选）生成回复
 
         把检索得到的记忆因果链路理解成故事片段，替代原 rerank 的扁平重排序。
         """
@@ -427,25 +435,34 @@ class PurposeDrivenRetriever:
         # 粗筛：按连通性拆分核心节点组
         core_groups = self.select_core_nodes(hop_history, result_ids)
 
-        # 细筛 + 理解：每组生成一个故事片段
+        # 合并所有核心节点（去重、保持 hop 顺序），一次性生成一段完整故事
+        all_nodes = []
+        seen = set()
+        for group in core_groups:
+            for nid in group:
+                if nid not in seen:
+                    seen.add(nid)
+                    all_nodes.append(nid)
+
         stories = []
         story_nodes = []
         discarded_nodes = []
-        for group in core_groups:
-            path = self._build_path(group, hop_history)
+        if all_nodes:
+            path = self._build_path(all_nodes, hop_history)
             out = self.inference.story_rank(query, path)
             story = out.get("story", "")
             adopted = out.get("adopted_ids", [])
             if story:
                 stories.append(story)
-            story_nodes.extend(adopted)
-            discarded_nodes.extend([nid for nid in group if nid not in adopted])
+            story_nodes = adopted
+            discarded_nodes = [nid for nid in all_nodes if nid not in adopted]
 
         result["stories"] = stories
         result["story_nodes"] = story_nodes
         result["discarded_nodes"] = discarded_nodes
 
         # 生成回复：聊天 LLM 只接收干净故事，替代 [id] content 列举
-        context_items = [f"[记忆片段] {s}" for s in stories]
-        result["response"] = self.inference.generate_response(query, context_items)
+        if with_response:
+            context_items = [f"[记忆片段] {s}" for s in stories]
+            result["response"] = self.inference.generate_response(query, context_items)
         return result

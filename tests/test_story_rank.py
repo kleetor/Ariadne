@@ -121,3 +121,28 @@ def test_story_rank_parses_story_and_adopted_ids():
     out = engine.story_rank("最近怎么样", path)
     assert out["story"] == "用户压力大，因为加班，常喝咖啡提神"
     assert out["adopted_ids"] == ["n1", "n2", "n3"]
+
+
+def test_select_core_nodes_no_infinite_loop_on_revisit():
+    """双向边折返（回访）时 parent 不应成环，回溯不死循环"""
+    graph = _graph()
+    r = _retriever(graph)
+
+    # 模拟双向边折返：n1 → n2 → n1
+    hop_history = [
+        {"hop": 0, "candidates": [
+            {"id": "n1", "content": "用户压力很大", "purpose_score": 0.5},
+        ]},
+        {"hop": 1, "candidates": [
+            {"id": "n2", "content": "经常加班到10点", "combined_score": 0.6,
+             "from": "n1", "rel_type": RelationType.CAUSAL, "is_reverse": False},
+        ]},
+        {"hop": 2, "candidates": [
+            {"id": "n1", "content": "用户压力很大", "combined_score": 0.4,
+             "from": "n2", "rel_type": RelationType.SCENARIO, "is_reverse": True},
+        ]},
+    ]
+
+    groups = r.select_core_nodes(hop_history, ["n1", "n2"])
+    assert len(groups) == 1
+    assert set(groups[0]) == {"n1", "n2"}

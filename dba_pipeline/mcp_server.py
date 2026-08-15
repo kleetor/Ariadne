@@ -137,42 +137,33 @@ class DBAServer:
         }
 
     def query_memory(self, query: str, rerank_k: int = 20) -> dict:
-        """检索记忆：走完整 P 链路（跳转轴+目的回归+寻峰）"""
+        """检索记忆：走完整 P 链路 + StoryRank 故事化，返回记忆故事片段"""
         if self.retriever is None:
-            return {"error": "检索链路未初始化（需要 embedding）", "memories": []}
+            return {"error": "检索链路未初始化（需要 embedding）", "stories": []}
 
         try:
             # 每次检索视为一次联想会话，重置同会话饱和计数（跨会话终身增强保留）
             if self.retriever.path_tracker is not None:
                 self.retriever.path_tracker.start_session()
-            result = self.retriever.retrieve(query)  # seed_k 用默认值；rerank_k 仅控制返回条数
-            memories = []
-            for mid, content in result.get("peak_memories", []):
-                node = self.graph.graph.nodes.get(mid, {})
-                if node.get("deprecated") or node.get("forgotten"):
-                    continue  # 过滤已废弃/遗忘的记忆
-                nt = node.get("node_type")
-                memories.append({
-                    "id": mid,
-                    "content": (content or "")[:200],
-                    "node_type": nt.value if hasattr(nt, "value") else str(nt),
-                    "deprecated": False,
-                    "score": round(result.get("peak_scores", {}).get(mid, 0.0), 4),
-                })
-            # rank-k：最多返回 rerank_k 条记忆（0 表示不截断）
+            # StoryRank：检索 → 连通性粗筛 → 故事化（不生成回复，交由 Agent 处理）
+            result = self.retriever.retrieve_with_story(query, with_response=False)
+            stories = result.get("stories", [])
+            # rank-k：最多返回 rerank_k 个故事片段（0 表示不截断）
             if rerank_k > 0:
-                memories = memories[:rerank_k]
+                stories = stories[:rerank_k]
             return {
-                "memories": memories,
+                "stories": stories,
+                "story_nodes": result.get("story_nodes", []),
+                "discarded_nodes": result.get("discarded_nodes", []),
                 "total_matched": result.get("total_candidates", 0),
-                "returned": len(memories),
+                "returned": len(stories),
                 "query": query,
                 "purpose": result.get("purpose"),
-                "method": "purpose_driven",
+                "method": "story_rank",
             }
         except Exception as e:
-            logging.error(f"P 链路检索失败: {e}", exc_info=True)
-            return {"error": str(e), "memories": [], "method": "purpose_driven_failed"}
+            logging.error(f"StoryRank 检索失败: {e}", exc_info=True)
+            return {"error": str(e), "stories": [], "method": "story_rank_failed"}
 
     def inspect_graph(self, node_id: str = None) -> dict:
         """查看图谱：指定节点展开 1-hop 邻居"""
@@ -432,18 +423,18 @@ TOOL_SCHEMAS = [
         "name": "dba_query_memory",
         "description": (
             "在回答用户问题、给出建议或延续话题之前，先调用此工具检索与查询相关的"
-            "历史记忆节点，以便结合用户过去的上下文做出更贴合的回答。"
+            "历史记忆，返回按因果链路整理好的故事片段，以便结合用户过去的上下文做出更贴合的回答。"
         ),
         "inputSchema": {
             "type": "object",
             "properties": {
                 "query": {
                     "type": "string",
-                    "description": "查询文本，用于联想检索相关的记忆节点",
+                    "description": "查询文本，用于联想检索相关的记忆",
                 },
                 "rerank_k": {
                     "type": "integer",
-                    "description": "最多返回的节点数（默认 20）",
+                    "description": "最多返回的故事片段数（默认 20，0 表示不截断）",
                 },
             },
             "required": ["query"],
